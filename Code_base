@@ -1,0 +1,362 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+from scipy.signal import medfilt
+import pywt
+from torch.cuda.amp import autocast, GradScaler
+import warnings
+warnings.filterwarnings('ignore')
+
+def set_seeds(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seeds()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+class ECGDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = torch.FloatTensor(features)
+        self.labels = torch.LongTensor(labels)
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+def preprocess_signal(signal):
+    """Advanced signal preprocessing with noise reduction and feature enhancement"""
+    try:
+        # Wavelet denoising
+        coeffs = pywt.wavedec(signal, 'db4', level=4)
+        threshold = np.std(coeffs[-1])/2
+        coeffs = [pywt.threshold(c, threshold, mode='soft') for c in coeffs]
+        denoised = pywt.waverec(coeffs, 'db4')
+        
+        # Baseline removal
+        baseline = medfilt(denoised, kernel_size=51)
+        baseline_corrected = denoised - baseline
+        
+        # Standardization
+        normalized = (baseline_corrected - np.mean(baseline_corrected)) / (np.std(baseline_corrected) + 1e-8)
+        
+        # Additional feature enhancement
+        normalized = np.clip(normalized, -5, 5)  # Remove extreme outliers
+        
+        return normalized
+    except Exception as e:
+        print(f"Error in preprocessing: {str(e)}")
+        return signal
+
+def load_and_prepare_data():
+    """Load and prepare PTB-DB dataset"""
+    print("\nLoading datasets...")
+    
+    # Load PTB-DB datasets
+    normal_df = pd.read_csv('ECG_data/ptbdb_normal.csv', header=None)
+    abnormal_df = pd.read_csv('ECG_data/ptbdb_abnormal.csv', header=None)
+    
+    print(f"Normal samples: {len(normal_df)}")
+    print(f"Abnormal samples: {len(abnormal_df)}")
+    
+    # Combine datasets
+    combined_data = pd.concat([normal_df, abnormal_df], axis=0, ignore_index=True)
+    
+    # Shuffle the combined dataset
+    combined_data = combined_data.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    # Split features and labels
+    X = combined_data.iloc[:, :-1].values
+    y = combined_data.iloc[:, -1].values
+    
+    # Print class distribution
+    print("\nClass distribution:")
+    unique, counts = np.unique(y, return_counts=True)
+    for label, count in zip(unique, counts):
+        print(f"Class {label}: {count} samples ({count/len(y)*100:.2f}%)")
+    
+    return X, y
+
+class AttentionBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 8),
+            nn.ReLU(),
+            nn.Linear(in_channels // 8, in_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        attention_weights = self.attention(x)
+        return x * attention_weights
+
+class AdvancedECGNet(nn.Module):
+    def __init__(self, num_classes=2):  # Changed to 2 classes for binary classification
+        super().__init__()
+        
+        self.features = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.2),
+            
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.2),
+            
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.2),
+            
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        
+        self.attention = AttentionBlock(512)
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.squeeze(-1)
+        x = self.attention(x)
+        x = self.classifier(x)
+        return x
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        return focal_loss.mean()
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=100, patience=6):
+    scaler = GradScaler()
+    best_val_acc = 0
+    best_model = None
+    patience_counter = 0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        correct = 0
+        total = 0
+        
+        for inputs, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+        
+        train_acc = 100. * correct / total
+        train_loss = train_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+        
+        val_acc = 100. * correct / total
+        val_loss = val_loss / len(val_loader)
+        
+        scheduler.step(val_loss)
+        
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        
+        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= patience:
+            print(f'\nEarly stopping triggered after epoch {epoch+1}')
+            break
+    
+    return best_model, history, best_val_acc
+
+def main():
+    try:
+        # Load and preprocess data
+        X, y = load_and_prepare_data()
+        
+        print("\nPreprocessing signals...")
+        X_processed = np.array([preprocess_signal(signal) for signal in tqdm(X)])
+        X_processed = X_processed.reshape(-1, 1, X_processed.shape[1])
+        
+        # Train ensemble
+        num_models = 5
+        ensemble = []
+        
+        for i in range(num_models):
+            print(f"\nTraining model {i+1}/{num_models}")
+            
+            # Split data with different seeds for diversity
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_processed, y, test_size=0.2, 
+                stratify=y, random_state=42+i
+            )
+            
+            # Create data loaders
+            train_dataset = ECGDataset(X_train, y_train)
+            val_dataset = ECGDataset(X_val, y_val)
+            
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=32)
+            
+            # Initialize model and training components
+            model = AdvancedECGNet().to(device)
+            criterion = FocalLoss(gamma=2)
+            optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=3, verbose=True
+            )
+            
+            # Train model
+            best_state, history, best_acc = train_model(
+                model, train_loader, val_loader, criterion, optimizer, scheduler
+            )
+            
+            ensemble.append({
+                'state_dict': best_state,
+                'val_acc': best_acc
+            })
+            
+            print(f"\nModel {i+1} best validation accuracy: {best_acc:.2f}%")
+            
+            # Plot training history
+            plt.figure(figsize=(12, 4))
+            plt.subplot(1, 2, 1)
+            plt.plot(history['train_loss'], label='Train Loss')
+            plt.plot(history['val_loss'], label='Val Loss')
+            plt.title(f'Model {i+1} Loss')
+            plt.legend()
+            
+            plt.subplot(1, 2, 2)
+            plt.plot(history['train_acc'], label='Train Acc')
+            plt.plot(history['val_acc'], label='Val Acc')
+            plt.title(f'Model {i+1} Accuracy')
+            plt.legend()
+            plt.show()
+        
+        # Save ensemble
+        torch.save(ensemble, 'ecg_ensemble_ptb.pth')
+        
+        # Final evaluation
+        print("\nEvaluating ensemble...")
+        test_dataset = ECGDataset(X_val, y_val)
+        test_loader = DataLoader(test_dataset, batch_size=32)
+        
+        all_predictions = []
+        
+        with torch.no_grad():
+            for model_dict in ensemble:
+                model = AdvancedECGNet().to(device)
+                model.load_state_dict(model_dict['state_dict'])
+                model.eval()
+                
+                predictions = []
+                for inputs, _ in test_loader:
+                    inputs = inputs.to(device)
+                    outputs = model(inputs)
+                    predictions.extend(outputs.softmax(dim=1).cpu().numpy())
+                
+                all_predictions.append(predictions)
+        
+        # Weighted average of predictions
+        weights = np.array([model_dict['val_acc'] for model_dict in ensemble])
+        weights = weights / weights.sum()
+        
+        ensemble_predictions = np.average(all_predictions, weights=weights, axis=0)
+        ensemble_classes = np.argmax(ensemble_predictions, axis=1)
+        
+        # Print results
+        accuracy = (ensemble_classes == y_val).mean() * 100
+        print(f"\nFinal Ensemble Test Accuracy: {accuracy:.2f}%")
+        print("\nClassification Report:")
+        print(classification_report(y_val, ensemble_classes, 
+                                 target_names=['Normal', 'Abnormal']))
+        
+        # Plot confusion matrix
+        cm = confusion_matrix(y_val, ensemble_classes)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=['Normal', 'Abnormal'],
+                   yticklabels=['Normal', 'Abnormal'])
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.show()
+        
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
